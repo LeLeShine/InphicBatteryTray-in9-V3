@@ -283,6 +283,7 @@ namespace InphicBatteryTray
         static NotifyIcon tray;
         static Icon currentIcon;
         static string logPath = null;
+        static string statePath = null;
         static Bitmap srcIcon = null;
         static MenuItem autoItem;
         static int lastDrawnLevel = -999;
@@ -307,9 +308,60 @@ namespace InphicBatteryTray
             catch { }
         }
 
+        // 充电期间设备只上报 100%，缓存最后一次非充电电量供此时显示
+        static int LoadLastBattery(string label)
+        {
+            try
+            {
+                if (statePath == null || !File.Exists(statePath)) return -1;
+                foreach (string line in File.ReadAllLines(statePath))
+                {
+                    int eq = line.IndexOf('=');
+                    if (eq <= 0) continue;
+                    if (line.Substring(0, eq) != label) continue;
+                    int v;
+                    if (int.TryParse(line.Substring(eq + 1), out v) && v >= 0 && v <= 100) return v;
+                }
+            }
+            catch { }
+            return -1;
+        }
+
+        static void SaveLastBattery(string label, int level)
+        {
+            try
+            {
+                if (statePath == null) return;
+                var lines = new List<string>();
+                if (File.Exists(statePath)) lines.AddRange(File.ReadAllLines(statePath));
+                bool found = false;
+                for (int i = 0; i < lines.Count; i++)
+                {
+                    int eq = lines[i].IndexOf('=');
+                    if (eq > 0 && lines[i].Substring(0, eq) == label)
+                    {
+                        lines[i] = label + "=" + level;
+                        found = true;
+                    }
+                }
+                if (!found) lines.Add(label + "=" + level);
+                File.WriteAllLines(statePath, lines.ToArray());
+            }
+            catch { }
+        }
+
         [STAThread]
         static void Main(string[] args)
         {
+            try
+            {
+                string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "InphicBatteryTray");
+                Directory.CreateDirectory(dir);
+                statePath = Path.Combine(dir, "last_battery.txt");
+            }
+            catch { statePath = null; }
+
             logPath = Environment.GetEnvironmentVariable("INPHIC_TRAY_LOG");
             foreach (string a in args)
             {
@@ -684,6 +736,18 @@ namespace InphicBatteryTray
                     var targets = new List<HidInterface>();
                     foreach (HidInterface d in all)
                     {
+                        if (IsIn9Vid(d.Vid))
+                            Log(string.Format("IN9 iface: {0:X4}:{1:X4} in={2} out={3} feat={4} {5}",
+                                d.Vid, d.Pid, d.InLen, d.OutLen, d.FeatLen, d.Product));
+
+                        // 已知走 IN9 查询协议的型号：不看 Feature 长度，直接主动查询
+                        if (IsIn9Pair(d.Vid, d.Pid))
+                        {
+                            d.IsIn9 = true;
+                            targets.Add(d);
+                            continue;
+                        }
+
                         bool matched = false;
                         foreach (ushort[] c in Candidates)
                         {
@@ -691,14 +755,10 @@ namespace InphicBatteryTray
                         }
                         if (matched) { d.IsIn9 = false; targets.Add(d); continue; }
 
-                        if (IsIn9Vid(d.Vid))
+                        if (IsIn9Vid(d.Vid) && d.FeatLen >= 33)
                         {
-                            bool featOk = d.FeatLen >= 33;
-                            Log(string.Format("IN9 iface: in={0} out={1} feat={2} {3}{4}",
-                                d.InLen, d.OutLen, d.FeatLen, d.Product,
-                                featOk ? "  <- candidate" : ""));
-                            // IN9 走 Feature Report（报告 ID 0x0C，33 字节）
-                            if (featOk) { d.IsIn9 = true; targets.Add(d); }
+                            d.IsIn9 = true;
+                            targets.Add(d);
                         }
                     }
                     Log(string.Format("enumerate: {0} hid interfaces, {1} candidates ({2} IN9)",
@@ -743,6 +803,19 @@ namespace InphicBatteryTray
         // IN9 系列：USB=VID_248A，2.4G=VID_249A（PID 不固定）
         static readonly ushort[] In9Vids = new ushort[] { 0x248A, 0x249A };
 
+        // 已知走 IN9 主动查询的 VID/PID（V3 接收器 249A:5C2F）
+        static readonly ushort[][] In9Pairs = new ushort[][]
+        {
+            new ushort[]{0x249A,0x5C2F},
+        };
+
+        static bool IsIn9Pair(ushort vid, ushort pid)
+        {
+            for (int i = 0; i < In9Pairs.Length; i++)
+                if (In9Pairs[i][0] == vid && In9Pairs[i][1] == pid) return true;
+            return false;
+        }
+
         static bool IsIn9Vid(ushort vid)
         {
             for (int i = 0; i < In9Vids.Length; i++)
@@ -769,16 +842,17 @@ namespace InphicBatteryTray
         //   0C 01 <cmd> 00 <seq> <payload...>
         //   握手 cmd=0xF0 payload=01 01 FF
         //   查电量 cmd=0x20 payload=00 00
-        static byte[] BuildIn9Frame(byte cmd, byte seq, byte[] payload)
+        static byte[] BuildIn9Frame(byte cmd, byte seq, byte[] payload, int len)
         {
-            byte[] f = new byte[33];
+            if (len < 33) len = 33;
+            byte[] f = new byte[len];
             f[0] = 0x0C;      // 报告 ID
             f[1] = 0x01;
             f[2] = cmd;
             f[3] = 0x00;
             f[4] = seq;
             if (payload != null)
-                Array.Copy(payload, 0, f, 5, Math.Min(payload.Length, 28));
+                Array.Copy(payload, 0, f, 5, Math.Min(payload.Length, len - 5));
             return f;
         }
 
@@ -850,38 +924,62 @@ namespace InphicBatteryTray
         static void In9QueryLoop(HidInterface dev)
         {
             string label = string.Format("{0:X4}:{1:X4}", dev.Vid, dev.Pid);
-            Log("IN9 try open: " + dev.Path);
+
+            // V3 接收器没有 Feature 报告，改用 33 字节输出报告下发查询（见 V3QueryLoop）
+            bool featureMode = dev.FeatLen >= 33;
+            bool outputMode = !featureMode && dev.OutLen >= 33;
+            if (!featureMode && !outputMode)
+            {
+                Log(string.Format("IN9 skip {0} [{1}]: in={2} out={3} feat={4}",
+                    dev.Product, label, dev.InLen, dev.OutLen, dev.FeatLen));
+                return;
+            }
+
+            Log("IN9 try open (" + (outputMode ? "out/in" : "feature") + "): " + dev.Path);
             IntPtr h = Native.CreateFileW(dev.Path,
                 Native.GENERIC_READ | Native.GENERIC_WRITE,
                 Native.FILE_SHARE_READ | Native.FILE_SHARE_WRITE,
-                IntPtr.Zero, Native.OPEN_EXISTING, 0, IntPtr.Zero);
+                IntPtr.Zero, Native.OPEN_EXISTING,
+                outputMode ? Native.FILE_FLAG_OVERLAPPED : 0, IntPtr.Zero);
             if (h == Native.INVALID_HANDLE_VALUE)
             {
                 Log("IN9 open FAILED err=" + Marshal.GetLastWin32Error());
                 return;
             }
-            Log("IN9 opened OK: " + dev.Product + "  feat=" + dev.FeatLen);
+
+            int frameLen = featureMode ? Math.Max(33, dev.FeatLen) : Math.Max(33, dev.OutLen);
+            int respLen = Math.Max(33, dev.InLen);
+            Log(string.Format("IN9 opened OK: {0}  mode={1} in={2} out={3} feat={4} frame={5} resp={6}",
+                dev.Product, outputMode ? "out/in" : "feature",
+                dev.InLen, dev.OutLen, dev.FeatLen, frameLen, respLen));
 
             byte seq = 0x01;
-            byte[] resp = new byte[33];
+            byte[] resp = new byte[respLen];
             int failStreak = 0;
             int polls = 0;
 
             try
             {
+                if (!featureMode)
+                {
+                    V3QueryLoop(h, dev, label, frameLen, respLen);
+                    return;
+                }
+
                 while (running)
                 {
                     // 握手（只发不收）：0C 01 F0 00 <seq> 01 01 FF
-                    byte[] hs = BuildIn9Frame(0xF0, seq, new byte[] { 0x01, 0x01, 0xFF });
-                    Native.HidD_SetFeature(h, hs, hs.Length);
-
+                    byte[] hs = BuildIn9Frame(0xF0, seq, new byte[] { 0x01, 0x01, 0xFF }, frameLen);
                     // 查电量：0C 01 20 00 <seq> 00 00
-                    byte[] q = BuildIn9Frame(0x20, seq, new byte[] { 0x00, 0x00 });
+                    byte[] q = BuildIn9Frame(0x20, seq, new byte[] { 0x00, 0x00 }, frameLen);
                     polls++;
 
-                    if (!Native.HidD_SetFeature(h, q, q.Length))
+                    Native.HidD_SetFeature(h, hs, hs.Length);
+                    bool sent = Native.HidD_SetFeature(h, q, q.Length);
+
+                    if (!sent)
                     {
-                        Log("IN9 SetFeature FAILED err=" + Marshal.GetLastWin32Error());
+                        Log("IN9 send FAILED err=" + Marshal.GetLastWin32Error());
                         if (++failStreak >= 3) { Log("IN9 give up this interface"); break; }
                     }
                     else
@@ -889,13 +987,13 @@ namespace InphicBatteryTray
                         failStreak = 0;
                         Thread.Sleep(10);
                         Array.Clear(resp, 0, resp.Length);
-                        if (!Native.HidD_GetFeature(h, resp, resp.Length))
-                        {
+                        bool got = Native.HidD_GetFeature(h, resp, resp.Length);
+                        if (!got && polls <= 5)
                             Log("IN9 GetFeature FAILED err=" + Marshal.GetLastWin32Error());
-                        }
-                        else
+
+                        if (got)
                         {
-                            if (polls <= 5) Log("IN9 rx: " + Hex(resp, 33));
+                            if (polls <= 5) Log("IN9 rx: " + Hex(resp, Math.Min(resp.Length, 33)));
                             AcceptIn9(dev, label, resp, polls <= 5);
                         }
                     }
@@ -908,6 +1006,131 @@ namespace InphicBatteryTray
             catch (ThreadInterruptedException) { }
             catch (Exception ex) { Log("IN9 loop exception: " + ex.Message); }
             finally { Native.CloseHandle(h); }
+        }
+
+        // V3 接收器（249A:5C2F）实测协议：
+        //   查询  33 字节输出报告  00 <queryId> 00 ... 00
+        //   回复  00 <id> 00 01 <len> <payload...> <sum>   sum = payload 字节和
+        //   NACK  00 <id> 02 FF（背靠背连发时出现，因此每轮只发一条）
+        //   推送  00 C0 <无线标志> <电量> <充电标志>
+        // 电量位于 0x10 回复的 payload[9]（绝对偏移 14），0-100 百分比；
+        // 充电标志：0x10 回复的 payload[8]（绝对偏移 13）或推送里电量之后的一字节
+        // （绝对偏移 4），非 0 为充电中。推送里电量前面的 <无线标志> 与充电无关。
+        // 充电中设备固定上报 100%，需显示插线前的真实电量（本地缓存兜底）。
+        static void V3QueryLoop(IntPtr h, HidInterface dev, string label, int frameLen, int respLen)
+        {
+            byte[] req = new byte[frameLen];
+            byte[] resp = new byte[respLen];
+            int failStreak = 0;
+            int polls = 0;
+
+            while (running)
+            {
+                polls++;
+
+                Array.Clear(req, 0, req.Length);
+                req[0] = 0x00;
+                req[1] = 0x10;   // 设备信息（含电量）
+
+                if (!HidWrite(h, req, frameLen))
+                {
+                    Log("IN9 v3 send FAILED err=" + Marshal.GetLastWin32Error());
+                    if (++failStreak >= 3) { Log("IN9 v3 give up this interface"); break; }
+                    Thread.Sleep(2500);
+                    continue;
+                }
+                failStreak = 0;
+
+                bool got = false;
+                for (int i = 0; i < 8; i++)
+                {
+                    Array.Clear(resp, 0, resp.Length);
+                    int n = HidReadTimeout(h, resp, 300);
+                    if (n <= 0) break;
+                    if (polls <= 3) Log("IN9 v3 rx: " + Hex(resp, Math.Min(n, 33)));
+                    if (AcceptV3(dev, label, resp, n, polls <= 3)) { got = true; break; }
+                }
+                if (!got && polls <= 3)
+                    Log("IN9 v3 no battery in reply");
+
+                Thread.Sleep(2500);
+            }
+        }
+
+        static bool AcceptV3(HidInterface dev, string label, byte[] resp, int n, bool dump)
+        {
+            if (n < 4 || resp[0] != 0x00) return false;
+
+            int lv = -1;
+            int charge = -1;
+
+            if (resp[1] == 0xC0)
+            {
+                // 未请求推送：00 C0 <无线标志> <电量> <充电标志>
+                int v = resp[3];
+                if (v <= 100) lv = v;
+                if (n >= 5) charge = (resp[4] != 0) ? 3 : 1;
+            }
+            else if (resp[1] == 0x10 && resp[2] == 0x00 && resp[3] == 0x01 && n >= 5)
+            {
+                int len = resp[4];
+                if (len >= 10 && 5 + len <= n - 1)
+                {
+                    // 校验和固定位于报告最后一字节
+                    int sum = 0;
+                    for (int i = 0; i < len; i++) sum += resp[5 + i];
+                    if ((sum & 0xFF) == resp[n - 1])
+                    {
+                        int v = resp[5 + 9];
+                        if (v <= 100) lv = v;
+                        if (len >= 9) charge = (resp[5 + 8] != 0) ? 3 : 1;
+                    }
+                }
+            }
+
+            if (lv < 0) return false;
+
+            DateTime now = DateTime.Now;
+            lock (sync)
+            {
+                DeviceState st;
+                if (!states.TryGetValue(label, out st))
+                {
+                    st = new DeviceState();
+                    st.Label = label;
+                    states[label] = st;
+                }
+                if (st.LastSeen != DateTime.MinValue)
+                    st.LastIntervalMs = (now - st.LastSeen).TotalMilliseconds;
+
+                bool charging = (charge == 3) || (charge < 0 && st.ChargeState == 3);
+
+                // 充电期间设备把电量固定上报为 100（推送和 0x10 回复都是 0x64），
+                // 这时显示插线前的真实电量；程序在充电中启动时用本地缓存兜底
+                int shown = lv;
+                if (charging && lv == 100)
+                {
+                    int prev = (st.Battery >= 0 && st.Battery < 100) ? st.Battery : LoadLastBattery(label);
+                    if (prev >= 0 && prev < 100) shown = prev;
+                }
+
+                bool changed = (st.Battery != shown || (charge >= 0 && st.ChargeState != charge));
+                st.Battery = shown;
+                if (charge >= 0) st.ChargeState = charge;
+                if (!charging && changed) SaveLastBattery(label, shown);
+                st.Protocol = "IN9 v3 query";
+                st.LastSeen = now;
+                st.Product = dev.Product;
+                st.Vid = dev.Vid;
+                st.Pid = dev.Pid;
+                st.Transport = dev.Transport;
+
+                if (changed || dump)
+                    Log("IN9 v3 battery " + shown + "%  charge=" + charge + "  ["
+                        + dev.Product + "] " + Hex(resp, Math.Min(n, 33)));
+            }
+            UpdateTrayUI();
+            return true;
         }
 
         static void AcceptIn9(HidInterface dev, string label, byte[] resp, bool dump)
